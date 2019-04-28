@@ -419,6 +419,20 @@ def download(directory, filename):
 
 
 def static_mnist_dataset(directory, split_name):
+    import tensorflow.examples.tutorials.mnist
+    mnist_datasets = tensorflow.examples.tutorials.mnist.input_data.read_data_sets(directory)
+    if split_name == "train":
+        result =  mnist_datasets.train
+    elif split_name == "valid":
+        result = mnist_datasets.validation
+    elif split_name == "test":
+        result = mnist.test
+    else:
+        assert False
+    result = tf.data.Dataset.from_tensor_slices((result.images, result.labels))
+    return result.map(lambda image, label: (tf.cast(tf.reshape(image, [28,28,1]), dtype=tf.float32), tf.cast(label, tf.int32)))
+
+def static_binary_mnist_dataset(directory, split_name):
   """Returns binary static MNIST tf.data.Dataset."""
   amat_file = download(directory, FILE_TEMPLATE.format(split=split_name))
   dataset = tf.data.TextLineDataset(amat_file)
