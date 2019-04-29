@@ -220,6 +220,8 @@ def make_decoder(activation, latent_size, output_shape, base_depth):
   conv = functools.partial(
       tf.keras.layers.Conv2D, padding="SAME", activation=activation)
 
+  output_depth = output_shape[-1]
+
   decoder_net = tf.keras.Sequential([
       deconv(2 * base_depth, 7, padding="VALID"),
       deconv(2 * base_depth, 5),
@@ -227,7 +229,7 @@ def make_decoder(activation, latent_size, output_shape, base_depth):
       deconv(base_depth, 5),
       deconv(base_depth, 5, 2),
       deconv(base_depth, 5),
-      conv(output_shape[-1], 5, activation=None),
+      conv(output_depth*2, 5, activation=None),
   ])
 
   def decoder(codes):
@@ -235,12 +237,24 @@ def make_decoder(activation, latent_size, output_shape, base_depth):
     # Collapse the sample and batch dimension and convert to rank-4 tensor for
     # use with a convolutional decoder network.
     codes = tf.reshape(codes, (-1, 1, 1, latent_size))
+    
+    #logits = decoder_net(codes)
+    #logits = tf.reshape(
+    #    logits, shape=tf.concat([original_shape[:-1], output_shape], axis=0))
+    #return tfd.Independent(tfd.Bernoulli(logits=logits),
+    #                       reinterpreted_batch_ndims=len(output_shape),
+    #                       name="image")
+
     logits = decoder_net(codes)
-    logits = tf.reshape(
-        logits, shape=tf.concat([original_shape[:-1], output_shape], axis=0))
-    return tfd.Independent(tfd.Bernoulli(logits=logits),
-                           reinterpreted_batch_ndims=len(output_shape),
-                           name="image")
+    logits = tf.reshape(logits, shape=tf.concat([original_shape[:-1], output_shape[:-1], [output_depth*2]], axis=0))
+
+    return tfd.Independent(
+                tfd.Normal(
+                    loc=logits[...,:output_depth],
+                    scale=tf.nn.softplus(logits[...,output_depth:] + _softplus_inverse(1.0))
+                ),
+                reinterpreted_batch_ndims=len(output_shape),
+                name="image")
 
   return decoder
 
