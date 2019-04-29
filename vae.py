@@ -498,6 +498,8 @@ def build_input_fns(data_dir, batch_size):
 def main(argv):
   del argv  # unused
 
+  tf.compat.v1.logging.set_verbosity(tf.logging.DEBUG)
+
   params = FLAGS.flag_values_dict()
   params["activation"] = getattr(tf.nn, params["activation"])
   if FLAGS.delete_existing and tf.io.gfile.exists(FLAGS.model_dir):
