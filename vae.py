@@ -204,7 +204,7 @@ def make_encoder(activation, latent_size, base_depth):
   return encoder
 
 
-def make_decoder(activation, latent_size, output_shape, base_depth):
+def make_decoder(activation, latent_size, output_shape, base_depth, scale_min=0.001, scale_range=1):
   """Creates the decoder function.
   Args:
     activation: Activation function in hidden layers.
@@ -229,7 +229,7 @@ def make_decoder(activation, latent_size, output_shape, base_depth):
       deconv(base_depth, 5),
       deconv(base_depth, 5, 2),
       deconv(base_depth, 5),
-      conv(output_depth*2, 5, activation=None),
+      conv(2*output_depth, 5, activation=None),
   ])
 
   def decoder(codes):
@@ -248,10 +248,20 @@ def make_decoder(activation, latent_size, output_shape, base_depth):
     logits = decoder_net(codes)
     logits = tf.reshape(logits, shape=tf.concat([original_shape[:-1], output_shape[:-1], [output_depth*2]], axis=0))
 
+    loc=logits[...,:output_depth]
+    scale=scale_min+scale_range*tf.nn.sigmoid(logits[...,output_depth:])#min_scale+tf.nn.softplus(logits[...,output_depth:] + _softplus_inverse(1.0))
+  
+    tf.compat.v1.summary.scalar("loc", tf.reduce_mean(input_tensor=loc))
+    tf.compat.v1.summary.scalar("loc_max", tf.reduce_max(input_tensor=loc))
+    tf.compat.v1.summary.scalar("loc_min", tf.reduce_min(input_tensor=loc))
+    tf.compat.v1.summary.scalar("scale", tf.reduce_mean(input_tensor=scale))
+    tf.compat.v1.summary.scalar("scale_max", tf.reduce_max(input_tensor=scale))
+    tf.compat.v1.summary.scalar("scale_min", tf.reduce_min(input_tensor=scale))
+
     return tfd.Independent(
-                tfd.Normal(
-                    loc=logits[...,:output_depth],
-                    scale=tf.nn.softplus(logits[...,output_depth:] + _softplus_inverse(1.0))
+                tfd.Logistic(
+                    loc=loc,
+                    scale=scale
                 ),
                 reinterpreted_batch_ndims=len(output_shape),
                 name="image")
@@ -360,6 +370,9 @@ def model_fn(features, labels, mode, params, config):
   distortion = -decoder_likelihood.log_prob(features)
   avg_distortion = tf.reduce_mean(input_tensor=distortion)
   tf.compat.v1.summary.scalar("distortion", avg_distortion)
+
+  tf.compat.v1.summary.scalar("distortion_max", tf.reduce_max(input_tensor=distortion))
+  tf.compat.v1.summary.scalar("distortion_min", tf.reduce_min(input_tensor=distortion))
 
   if params["analytic_kl"]:
     rate = tfd.kl_divergence(approx_posterior, latent_prior)
