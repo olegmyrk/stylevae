@@ -103,6 +103,9 @@ from six.moves import urllib
 import tensorflow as tf
 import tensorflow_probability as tfp
 
+from tensorflow.python.ops import variable_scope
+from tensorflow.contrib.framework.python.ops import variables as variable_lib
+
 tfd = tfp.distributions
 
 IMAGE_SHAPE = [28, 28, 1]
@@ -190,7 +193,7 @@ def make_encoder(activation, latent_size, base_depth):
       conv(4 * latent_size, 7, padding="VALID"),
       tf.keras.layers.Flatten(),
       tf.keras.layers.Dense(2 * latent_size, activation=None),
-  ])
+  ], name="EncoderSequential")
 
   def encoder(images):
     images = 2 * tf.cast(images, dtype=tf.float32) - 1
@@ -230,7 +233,7 @@ def make_decoder(activation, latent_size, output_shape, base_depth, scale_min=0.
       deconv(base_depth, 5, 2),
       deconv(base_depth, 5),
       conv(2*output_depth, 5, activation=None),
-  ])
+  ], name="DecoderSequential")
 
   def decoder(codes):
     original_shape = tf.shape(input=codes)
@@ -298,6 +301,10 @@ def make_mixture_prior(latent_size, mixture_components):
       mixture_distribution=tfd.Categorical(logits=mixture_logits),
       name="prior")
 
+def make_generator_prior(latent_size):
+  return tfd.MultivariateNormalDiag(
+            loc=tf.zeros([latent_size]),
+            scale_identity_multiplier=1.0)
 
 def pack_images(images, rows, cols):
   """Helper utility to make a field of images."""
@@ -320,7 +327,6 @@ def image_tile_summary(name, tensor, rows=8, cols=8):
   tf.compat.v1.summary.image(
       name, pack_images(tensor, rows, cols), max_outputs=1)
 
-
 def model_fn(features, labels, mode, params, config):
   """Builds the model function for use in an estimator.
   Arguments:
@@ -339,92 +345,135 @@ def model_fn(features, labels, mode, params, config):
         "Using `analytic_kl` is only supported when `mixture_components = 1` "
         "since there's no closed form otherwise.")
 
-  encoder = make_encoder(params["activation"],
-                         params["latent_size"],
-                         params["base_depth"])
-  decoder = make_decoder(params["activation"],
-                         params["latent_size"],
-                         IMAGE_SHAPE,
-                         params["base_depth"])
-  latent_prior = make_mixture_prior(params["latent_size"],
-                                    params["mixture_components"])
-
   image_tile_summary(
       "input", tf.cast(features, dtype=tf.float32), rows=1, cols=16)
 
-  approx_posterior = encoder(features)
-  approx_posterior_sample = approx_posterior.sample(params["n_samples"])
-  decoder_likelihood = decoder(approx_posterior_sample)
-  image_tile_summary(
-      "recon/sample",
-      tf.cast(decoder_likelihood.sample()[:3, :16], dtype=tf.float32),
-      rows=3,
-      cols=16)
-  image_tile_summary(
-      "recon/mean",
-      decoder_likelihood.mean()[:3, :16],
-      rows=3,
-      cols=16)
+  with variable_scope.variable_scope("VI", reuse=tf.AUTO_REUSE) as vi_scope:
+      encoder = make_encoder(params["activation"],
+                             params["latent_size"],
+                             params["base_depth"])
+      decoder = make_decoder(params["activation"],
+                             params["latent_size"],
+                             IMAGE_SHAPE,
+                             params["base_depth"])
+      latent_prior = make_mixture_prior(params["latent_size"],
+                                        params["mixture_components"])
 
-  # `distortion` is just the negative log likelihood.
-  distortion = -decoder_likelihood.log_prob(features)
-  avg_distortion = tf.reduce_mean(input_tensor=distortion)
-  tf.compat.v1.summary.scalar("distortion", avg_distortion)
+  # Energy function
+  def energy(inputs, label=""):
+      with variable_scope.variable_scope(vi_scope, reuse=tf.AUTO_REUSE):
+          approx_posterior = encoder(inputs)
+          approx_posterior_sample = approx_posterior.sample(params["n_samples"])
+          decoder_likelihood = decoder(approx_posterior_sample)
 
-  tf.compat.v1.summary.scalar("distortion_max", tf.reduce_max(input_tensor=distortion))
-  tf.compat.v1.summary.scalar("distortion_min", tf.reduce_min(input_tensor=distortion))
+      image_tile_summary(
+          label + "recon/sample",
+          tf.cast(decoder_likelihood.sample()[:3, :16], dtype=tf.float32),
+          rows=3,
+          cols=16)
+      image_tile_summary(
+          label + "recon/mean",
+          decoder_likelihood.mean()[:3, :16],
+          rows=3,
+          cols=16)
 
-  if params["analytic_kl"]:
-    rate = tfd.kl_divergence(approx_posterior, latent_prior)
-  else:
-    rate = (approx_posterior.log_prob(approx_posterior_sample)
-            - latent_prior.log_prob(approx_posterior_sample))
-  avg_rate = tf.reduce_mean(input_tensor=rate)
-  tf.compat.v1.summary.scalar("rate", avg_rate)
+      # `distortion` is just the negative log likelihood.
+      distortion = -decoder_likelihood.log_prob(inputs)
+      avg_distortion = tf.reduce_mean(input_tensor=distortion)
+      tf.compat.v1.summary.scalar(label + "distortion", avg_distortion)
 
-  elbo_local = -(rate + distortion)
+      tf.compat.v1.summary.scalar(label + "distortion_max", tf.reduce_max(input_tensor=distortion))
+      tf.compat.v1.summary.scalar(label + "distortion_min", tf.reduce_min(input_tensor=distortion))
 
-  elbo = tf.reduce_mean(input_tensor=elbo_local)
-  loss = -elbo
-  tf.compat.v1.summary.scalar("elbo", elbo)
+      if params["analytic_kl"]:
+        rate = tfd.kl_divergence(approx_posterior, latent_prior)
+      else:
+        rate = (approx_posterior.log_prob(approx_posterior_sample)
+                - latent_prior.log_prob(approx_posterior_sample))
+      avg_rate = tf.reduce_mean(input_tensor=rate)
+      tf.compat.v1.summary.scalar(label + "rate", avg_rate)
 
-  importance_weighted_elbo = tf.reduce_mean(
-      input_tensor=tf.reduce_logsumexp(input_tensor=elbo_local, axis=0) -
-      tf.math.log(tf.cast(params["n_samples"], dtype=tf.float32)))
-  tf.compat.v1.summary.scalar("elbo/importance_weighted",
-                              importance_weighted_elbo)
+      elbo_local = -(rate + distortion)
+
+      elbo = tf.reduce_mean(input_tensor=elbo_local)
+      tf.compat.v1.summary.scalar(label + "elbo", elbo)
+
+      importance_weighted_elbo = tf.reduce_mean(
+          input_tensor=tf.reduce_logsumexp(input_tensor=elbo_local, axis=0) -
+          tf.math.log(tf.cast(params["n_samples"], dtype=tf.float32)))
+      tf.compat.v1.summary.scalar(label + "elbo/importance_weighted",
+                                  importance_weighted_elbo)
+      eval_metric_ops = {
+              label + "elbo":
+                  tf.compat.v1.metrics.mean(elbo),
+              label + "elbo/importance_weighted":
+                  tf.compat.v1.metrics.mean(importance_weighted_elbo),
+              label + "rate":
+                  tf.compat.v1.metrics.mean(avg_rate),
+              label + "distortion":
+                  tf.compat.v1.metrics.mean(avg_distortion),
+          }
+      return elbo, importance_weighted_elbo, eval_metric_ops
 
   # Decode samples from the prior for visualization.
-  random_image = decoder(latent_prior.sample(16))
-  image_tile_summary(
-      "random/sample",
-      tf.cast(random_image.sample(), dtype=tf.float32),
-      rows=4,
-      cols=4)
-  image_tile_summary("random/mean", random_image.mean(), rows=4, cols=4)
+  with variable_scope.variable_scope(vi_scope, reuse=tf.AUTO_REUSE):
+      decoder_random_image = decoder(latent_prior.sample(16))
+      image_tile_summary(
+          "decoder/random/sample",
+          tf.cast(decoder_random_image.sample(), dtype=tf.float32),
+          rows=4,
+          cols=4)
+      image_tile_summary("decoder/random/mean", decoder_random_image.mean(), rows=4, cols=4)
+ 
+  # Build variational inference by minimizing the -ELBO.
+  vi_global_step = tf.compat.v1.train.get_or_create_global_step()
+  vi_elbo, vi_importance_weighted_elbo, vi_eval_metric_ops = energy(features, "vi/")
+  vi_loss = -vi_elbo
+  vi_learning_rate = tf.compat.v1.train.cosine_decay(
+      params["learning_rate"], vi_global_step, params["max_steps"])
+  tf.compat.v1.summary.scalar("vi_learning_rate", vi_learning_rate)
+  vi_optimizer = tf.compat.v1.train.AdamOptimizer(vi_learning_rate)
+  vi_train_op = vi_optimizer.minimize(vi_loss, var_list=variable_lib.get_trainable_variables(vi_scope))
 
-  # Perform variational inference by minimizing the -ELBO.
+  # Generator
+  with variable_scope.variable_scope("Generator", reuse=tf.AUTO_REUSE) as generator_scope:
+      generator = make_decoder(params["activation"],
+                             params["latent_size"],
+                             IMAGE_SHAPE,
+                             params["base_depth"])
+
+      generator_prior = make_generator_prior(params["latent_size"])
+      generator_output = generator(generator_prior.sample(params["batch_size"])).sample()
+
+  # Generate samples from the generator for visualization.
+  with variable_scope.variable_scope(generator_scope, reuse=tf.AUTO_REUSE):
+      generator_random_image = generator(generator_prior.sample(16))
+      image_tile_summary(
+          "generator/random/sample",
+          tf.cast(generator_random_image.sample(), dtype=tf.float32),
+          rows=4,
+          cols=4)
+      image_tile_summary("generator/random/mean", generator_random_image.mean(), rows=4, cols=4)
+  
+  # Build global step
   global_step = tf.compat.v1.train.get_or_create_global_step()
-  learning_rate = tf.compat.v1.train.cosine_decay(
-      params["learning_rate"], global_step, params["max_steps"])
-  tf.compat.v1.summary.scalar("learning_rate", learning_rate)
-  optimizer = tf.compat.v1.train.AdamOptimizer(learning_rate)
-  train_op = optimizer.minimize(loss, global_step=global_step)
 
+  # Build generator loss
+  generator_elbo, generator_importance_weighted_elbo, generator_eval_metric_ops = energy(generator_output, "generator/")
+  generator_loss = -generator_elbo
+  generator_learning_rate = tf.compat.v1.train.cosine_decay(
+      params["learning_rate"], global_step, params["max_steps"])
+  tf.compat.v1.summary.scalar("generator_learning_rate", generator_learning_rate)
+  generator_optimizer = tf.compat.v1.train.AdamOptimizer(generator_learning_rate)
+  generator_train_op = generator_optimizer.minimize(generator_loss, var_list=variable_lib.get_trainable_variables(generator_scope))
+
+  from tensorflow.contrib.gan import RunTrainOpsHook
   return tf.estimator.EstimatorSpec(
       mode=mode,
-      loss=loss,
-      train_op=train_op,
-      eval_metric_ops={
-          "elbo":
-              tf.compat.v1.metrics.mean(elbo),
-          "elbo/importance_weighted":
-              tf.compat.v1.metrics.mean(importance_weighted_elbo),
-          "rate":
-              tf.compat.v1.metrics.mean(avg_rate),
-          "distortion":
-              tf.compat.v1.metrics.mean(avg_distortion),
-      },
+      loss=vi_loss,
+      train_op=global_step.assign_add(1),
+      training_hooks=[RunTrainOpsHook(vi_train_op,1), RunTrainOpsHook(generator_train_op,1)],
+      eval_metric_ops={**vi_eval_metric_ops, **generator_eval_metric_ops},
   )
 
 
