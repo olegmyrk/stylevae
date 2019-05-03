@@ -252,7 +252,7 @@ def make_decoder(activation, latent_size, output_shape, base_depth, scale_min=0.
     logits = tf.reshape(logits, shape=tf.concat([original_shape[:-1], output_shape[:-1], [output_depth*2]], axis=0))
 
     loc=logits[...,:output_depth]
-    scale=scale_min+scale_range*tf.nn.sigmoid(logits[...,output_depth:])#min_scale+tf.nn.softplus(logits[...,output_depth:] + _softplus_inverse(1.0))
+    scale=scale_min+scale_range*tf.nn.sigmoid(logits[...,output_depth:])
   
     tf.compat.v1.summary.scalar("loc", tf.reduce_mean(input_tensor=loc))
     tf.compat.v1.summary.scalar("loc_max", tf.reduce_max(input_tensor=loc))
@@ -301,6 +301,51 @@ def make_mixture_prior(latent_size, mixture_components):
       mixture_distribution=tfd.Categorical(logits=mixture_logits),
       name="prior")
 
+def make_generator(activation, latent_size, output_shape, base_depth):
+  """Creates the generator function.
+  Args:
+    activation: Activation function in hidden layers.
+    latent_size: Dimensionality of the encoding.
+    output_shape: The output image shape.
+    base_depth: Smallest depth for a layer.
+  Returns:
+    generator: A `callable` mapping a `Tensor` of encodings to an image.
+  """
+  deconv = functools.partial(
+      tf.keras.layers.Conv2DTranspose, padding="SAME", activation=activation)
+  conv = functools.partial(
+      tf.keras.layers.Conv2D, padding="SAME", activation=activation)
+
+  output_depth = output_shape[-1]
+
+  decoder_net = tf.keras.Sequential([
+      deconv(2 * base_depth, 7, padding="VALID"),
+      deconv(2 * base_depth, 5),
+      deconv(2 * base_depth, 5, 2),
+      deconv(base_depth, 5),
+      deconv(base_depth, 5, 2),
+      deconv(base_depth, 5),
+      conv(output_depth, 5, activation=None),
+  ], name="GeneratorSequential")
+
+  def generator(codes):
+    original_shape = tf.shape(input=codes)
+    # Collapse the sample and batch dimension and convert to rank-4 tensor for
+    # use with a convolutional decoder network.
+    codes = tf.reshape(codes, (-1, 1, 1, latent_size))
+    
+    #logits = decoder_net(codes)
+    #logits = tf.reshape(
+    #    logits, shape=tf.concat([original_shape[:-1], output_shape], axis=0))
+    #return tfd.Independent(tfd.Bernoulli(logits=logits),
+    #                       reinterpreted_batch_ndims=len(output_shape),
+    #                       name="image")
+
+    logits = decoder_net(codes)
+    logits = tf.reshape(logits, shape=tf.concat([original_shape[:-1], output_shape[:-1], [output_depth]], axis=0))
+    return logits
+  return generator
+
 def make_generator_prior(latent_size):
   return tfd.MultivariateNormalDiag(
             loc=tf.zeros([latent_size]),
@@ -348,10 +393,12 @@ def model_fn(features, labels, mode, params, config):
   image_tile_summary(
       "input", tf.cast(features, dtype=tf.float32), rows=1, cols=16)
 
-  with variable_scope.variable_scope("VI", reuse=tf.AUTO_REUSE) as vi_scope:
+  with variable_scope.variable_scope("ENCODER", reuse=tf.AUTO_REUSE) as encoder_scope:
       encoder = make_encoder(params["activation"],
                              params["latent_size"],
                              params["base_depth"])
+
+  with variable_scope.variable_scope("DECODER", reuse=tf.AUTO_REUSE) as decoder_scope:
       decoder = make_decoder(params["activation"],
                              params["latent_size"],
                              IMAGE_SHAPE,
@@ -361,8 +408,10 @@ def model_fn(features, labels, mode, params, config):
 
   # Energy function
   def energy(inputs, label=""):
-      with variable_scope.variable_scope(vi_scope, reuse=tf.AUTO_REUSE):
+      with variable_scope.variable_scope(encoder_scope, reuse=tf.AUTO_REUSE):
           approx_posterior = encoder(inputs)
+
+      with variable_scope.variable_scope(decoder_scope, reuse=tf.AUTO_REUSE):
           approx_posterior_sample = approx_posterior.sample(params["n_samples"])
           decoder_likelihood = decoder(approx_posterior_sample)
 
@@ -374,6 +423,11 @@ def model_fn(features, labels, mode, params, config):
       image_tile_summary(
           label + "recon/mean",
           decoder_likelihood.mean()[:3, :16],
+          rows=3,
+          cols=16)
+      image_tile_summary(
+          label + "recon/stddev",
+          decoder_likelihood.stddev()[:3, :16],
           rows=3,
           cols=16)
 
@@ -416,64 +470,67 @@ def model_fn(features, labels, mode, params, config):
       return elbo, importance_weighted_elbo, eval_metric_ops
 
   # Decode samples from the prior for visualization.
-  with variable_scope.variable_scope(vi_scope, reuse=tf.AUTO_REUSE):
+  with variable_scope.variable_scope(decoder_scope, reuse=tf.AUTO_REUSE):
       decoder_random_image = decoder(latent_prior.sample(16))
-      image_tile_summary(
-          "decoder/random/sample",
-          tf.cast(decoder_random_image.sample(), dtype=tf.float32),
-          rows=4,
-          cols=4)
-      image_tile_summary("decoder/random/mean", decoder_random_image.mean(), rows=4, cols=4)
- 
-  # Build variational inference by minimizing the -ELBO.
-  vi_global_step = tf.compat.v1.train.get_or_create_global_step()
-  vi_elbo, vi_importance_weighted_elbo, vi_eval_metric_ops = energy(features, "vi/")
-  vi_loss = -vi_elbo
-  vi_learning_rate = tf.compat.v1.train.cosine_decay(
-      params["learning_rate"], vi_global_step, params["max_steps"])
-  tf.compat.v1.summary.scalar("vi_learning_rate", vi_learning_rate)
-  vi_optimizer = tf.compat.v1.train.AdamOptimizer(vi_learning_rate)
-  vi_train_op = vi_optimizer.minimize(vi_loss, var_list=variable_lib.get_trainable_variables(vi_scope))
+  image_tile_summary(
+      "decoder/random/sample",
+      tf.cast(decoder_random_image.sample(), dtype=tf.float32),
+      rows=4,
+      cols=4)
+  image_tile_summary("decoder/random/mean", decoder_random_image.mean(), rows=4, cols=4)
+  image_tile_summary("decoder/random/stddev", decoder_random_image.stddev(), rows=4, cols=4)
 
   # Generator
   with variable_scope.variable_scope("Generator", reuse=tf.AUTO_REUSE) as generator_scope:
-      generator = make_decoder(params["activation"],
+      generator = make_generator(params["activation"],
                              params["latent_size"],
                              IMAGE_SHAPE,
                              params["base_depth"])
 
       generator_prior = make_generator_prior(params["latent_size"])
-      generator_output = generator(generator_prior.sample(params["batch_size"])).sample()
+      generator_output = generator(generator_prior.sample(params["batch_size"]))
 
   # Generate samples from the generator for visualization.
   with variable_scope.variable_scope(generator_scope, reuse=tf.AUTO_REUSE):
       generator_random_image = generator(generator_prior.sample(16))
-      image_tile_summary(
-          "generator/random/sample",
-          tf.cast(generator_random_image.sample(), dtype=tf.float32),
-          rows=4,
-          cols=4)
-      image_tile_summary("generator/random/mean", generator_random_image.mean(), rows=4, cols=4)
-  
+  image_tile_summary("generator/random/mean", generator_random_image, rows=4, cols=4)
+ 
+  # Build positive ELBO
+  positive_elbo, positive_importance_weighted_elbo, positive_eval_metric_ops = energy(features, "positive/")
+  positive_loss = -positive_elbo
+
+  # Build positive ELBO
+  negative_elbo, negative_importance_weighted_elbo, negative_eval_metric_ops = energy(generator_output, "negative/")
+  negative_loss = -negative_elbo
+ 
   # Build global step
   global_step = tf.compat.v1.train.get_or_create_global_step()
 
-  # Build generator loss
-  generator_elbo, generator_importance_weighted_elbo, generator_eval_metric_ops = energy(generator_output, "generator/")
-  generator_loss = -generator_elbo
-  generator_learning_rate = tf.compat.v1.train.cosine_decay(
-      params["learning_rate"], global_step, params["max_steps"])
+  # Train encoder 
+  encoder_learning_rate = tf.compat.v1.train.cosine_decay(params["learning_rate"], global_step, params["max_steps"])
+  tf.compat.v1.summary.scalar("encoder_learning_rate", encoder_learning_rate)
+  encoder_optimizer = tf.compat.v1.train.AdamOptimizer(encoder_learning_rate)
+  encoder_train_op = encoder_optimizer.minimize(positive_loss, var_list=variable_lib.get_trainable_variables(encoder_scope))
+
+  # Train decoder 
+  decoder_learning_rate = tf.compat.v1.train.cosine_decay(params["learning_rate"], global_step, params["max_steps"])
+  tf.compat.v1.summary.scalar("decoder_learning_rate", decoder_learning_rate)
+  decoder_optimizer = tf.compat.v1.train.AdamOptimizer(decoder_learning_rate)
+  decoder_train_op = encoder_optimizer.minimize(positive_loss, var_list=variable_lib.get_trainable_variables(decoder_scope))
+ 
+  # Train generator 
+  generator_learning_rate = tf.compat.v1.train.cosine_decay(params["learning_rate"], global_step, params["max_steps"])
   tf.compat.v1.summary.scalar("generator_learning_rate", generator_learning_rate)
   generator_optimizer = tf.compat.v1.train.AdamOptimizer(generator_learning_rate)
-  generator_train_op = generator_optimizer.minimize(generator_loss, var_list=variable_lib.get_trainable_variables(generator_scope))
+  generator_train_op = generator_optimizer.minimize(negative_loss, var_list=variable_lib.get_trainable_variables(generator_scope))
 
   from tensorflow.contrib.gan import RunTrainOpsHook
   return tf.estimator.EstimatorSpec(
       mode=mode,
-      loss=vi_loss,
+      loss=positive_loss,
       train_op=global_step.assign_add(1),
-      training_hooks=[RunTrainOpsHook(vi_train_op,1), RunTrainOpsHook(generator_train_op,1)],
-      eval_metric_ops={**vi_eval_metric_ops, **generator_eval_metric_ops},
+      training_hooks=[RunTrainOpsHook(encoder_train_op,1), RunTrainOpsHook(decoder_train_op,1), RunTrainOpsHook(generator_train_op,1)],
+      eval_metric_ops={**positive_eval_metric_ops, **negative_eval_metric_ops},
   )
 
 
