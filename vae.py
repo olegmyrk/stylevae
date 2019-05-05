@@ -108,6 +108,8 @@ from tensorflow.contrib.framework.python.ops import variables as variable_lib
 
 tfd = tfp.distributions
 
+from glow.bijectors import GlowFlow
+
 IMAGE_SHAPE = [28, 28, 1]
 
 flags.DEFINE_float(
@@ -163,6 +165,16 @@ flags.DEFINE_bool(
     "delete_existing",
     default=False,
     help="If true, deletes existing `model_dir` directory.")
+flags.DEFINE_integer(
+    "glow_num_levels", 
+    default=2,
+    help="Number of Glow levels in the flow.")
+flags.DEFINE_integer(
+    "glow_level_depth", 
+    default=2,
+    help="Number of flow steps in each Glow level.")
+flags.DEFINE_float(
+    "generator_clip_gradient", default=1.0, help="Generator gradient clip norm.")
 
 FLAGS = flags.FLAGS
 
@@ -301,55 +313,10 @@ def make_mixture_prior(latent_size, mixture_components):
       mixture_distribution=tfd.Categorical(logits=mixture_logits),
       name="prior")
 
-def make_generator(activation, latent_size, output_shape, base_depth):
-  """Creates the generator function.
-  Args:
-    activation: Activation function in hidden layers.
-    latent_size: Dimensionality of the encoding.
-    output_shape: The output image shape.
-    base_depth: Smallest depth for a layer.
-  Returns:
-    generator: A `callable` mapping a `Tensor` of encodings to an image.
-  """
-  deconv = functools.partial(
-      tf.keras.layers.Conv2DTranspose, padding="SAME", activation=activation)
-  conv = functools.partial(
-      tf.keras.layers.Conv2D, padding="SAME", activation=activation)
-
-  output_depth = output_shape[-1]
-
-  decoder_net = tf.keras.Sequential([
-      deconv(2 * base_depth, 7, padding="VALID"),
-      deconv(2 * base_depth, 5),
-      deconv(2 * base_depth, 5, 2),
-      deconv(base_depth, 5),
-      deconv(base_depth, 5, 2),
-      deconv(base_depth, 5),
-      conv(output_depth, 5, activation=None),
-  ], name="GeneratorSequential")
-
-  def generator(codes):
-    original_shape = tf.shape(input=codes)
-    # Collapse the sample and batch dimension and convert to rank-4 tensor for
-    # use with a convolutional decoder network.
-    codes = tf.reshape(codes, (-1, 1, 1, latent_size))
-    
-    #logits = decoder_net(codes)
-    #logits = tf.reshape(
-    #    logits, shape=tf.concat([original_shape[:-1], output_shape], axis=0))
-    #return tfd.Independent(tfd.Bernoulli(logits=logits),
-    #                       reinterpreted_batch_ndims=len(output_shape),
-    #                       name="image")
-
-    logits = decoder_net(codes)
-    logits = tf.reshape(logits, shape=tf.concat([original_shape[:-1], output_shape[:-1], [output_depth]], axis=0))
-    return logits
-  return generator
-
-def make_generator_prior(latent_size):
-  return tfd.MultivariateNormalDiag(
-            loc=tf.zeros([latent_size]),
-            scale_identity_multiplier=1.0)
+def bits_per_dim(negative_log_likelihood, image_shape):
+    image_size = tf.cast(tf.reduce_prod(image_shape),dtype=tf.float32)
+    return ((negative_log_likelihood + tf.log(256.0) * image_size)
+            / (image_size * tf.log(2.0)))
 
 def pack_images(images, rows, cols):
   """Helper utility to make a field of images."""
@@ -482,24 +449,60 @@ def model_fn(features, labels, mode, params, config):
 
   # Generator
   with variable_scope.variable_scope("Generator", reuse=tf.AUTO_REUSE) as generator_scope:
-      generator = make_generator(params["activation"],
-                             params["latent_size"],
-                             IMAGE_SHAPE,
-                             params["base_depth"])
+      generator_base_distribution = tfd.MultivariateNormalDiag(
+          loc=tf.zeros(np.prod(features.shape[-3:])),
+          scale_diag=tf.ones(np.prod(features.shape[-3:])))
 
-      generator_prior = make_generator_prior(params["latent_size"])
-      generator_output = generator(generator_prior.sample(params["batch_size"]))
+      def build_generator():
+          generator_flow = GlowFlow(
+              num_levels=params['glow_num_levels'],
+              level_depth=params['glow_level_depth'])
 
-  # Generate samples from the generator for visualization.
-  with variable_scope.variable_scope(generator_scope, reuse=tf.AUTO_REUSE):
-      generator_random_image = generator(generator_prior.sample(16))
-  image_tile_summary("generator/random/mean", generator_random_image, rows=4, cols=4)
- 
-  # Build positive ELBO
+          generator = tfd.TransformedDistribution(
+              distribution=
+                tfd.TransformedDistribution(
+                    distribution=generator_base_distribution,
+                    bijector=tfp.bijectors.Reshape(event_shape_out=features.shape[-3:])
+                ),
+              bijector=generator_flow,
+              name="transformed_glow_flow")
+          return generator_flow, generator
+
+      generator_flow, generator = build_generator()
+      generator_z = generator_flow.inverse(features)
+      generator_prior_log_probs = generator_base_distribution.log_prob(generator_z)
+      generaotr_prior_log_likelihood = -tf.reduce_mean(generator_prior_log_probs)
+      generator_log_det_jacobians = generator_flow.inverse_log_det_jacobian(features, event_ndims=3)
+      generator_log_probs_alt = generator_log_det_jacobians + generator_log_det_jacobians
+      generator_log_probs = generator.log_prob(features)
+
+      # Sanity check, remove when tested
+      with tf.control_dependencies([tf.equal(generator_log_probs, generator_log_probs_alt)]):
+          generator_negative_log_likelihood = -tf.reduce_mean(generator_log_probs)
+          generator_bpd = bits_per_dim(generator_negative_log_likelihood, features.shape[-3:])
+
+          generator_flow_gen, generator_gen = build_generator()
+          generator_output = generator_gen.sample(params["batch_size"])
+          generator_entropy = -tf.reduce_mean(generator_gen.log_prob(generator_output))
+
+  tf.summary.scalar(
+        "generator/negative_log_likelihood",
+        tf.reshape(generator_negative_log_likelihood, []))
+  tf.summary.scalar("generator/bit_per_dim", tf.reshape(generator_bpd, []))
+
+  # Samples from the generator for visualization.
+  image_tile_summary(
+      "generator/output",
+      tf.cast(generator_output, dtype=tf.float32),
+      rows=1,
+      cols=generator_output.shape[0])
+  tf.compat.v1.summary.scalar("generator/entropy", tf.reshape(generator_entropy, []))
+
+  # Build positive loss
   positive_elbo, positive_importance_weighted_elbo, positive_eval_metric_ops = energy(features, "positive/")
   positive_loss = -positive_elbo
 
-  # Build positive ELBO
+  # Build negative loss
   negative_elbo, negative_importance_weighted_elbo, negative_eval_metric_ops = energy(generator_output, "negative/")
   negative_loss = -negative_elbo
  
@@ -508,26 +511,34 @@ def model_fn(features, labels, mode, params, config):
 
   # Train encoder 
   encoder_learning_rate = tf.compat.v1.train.cosine_decay(params["learning_rate"], global_step, params["max_steps"])
-  tf.compat.v1.summary.scalar("encoder_learning_rate", encoder_learning_rate)
+  tf.compat.v1.summary.scalar("encoder/learning_rate", encoder_learning_rate)
   encoder_optimizer = tf.compat.v1.train.AdamOptimizer(encoder_learning_rate)
   encoder_train_op = encoder_optimizer.minimize(positive_loss, var_list=variable_lib.get_trainable_variables(encoder_scope))
 
   # Train decoder 
   decoder_learning_rate = tf.compat.v1.train.cosine_decay(params["learning_rate"], global_step, params["max_steps"])
-  tf.compat.v1.summary.scalar("decoder_learning_rate", decoder_learning_rate)
+  tf.compat.v1.summary.scalar("decoder/learning_rate", decoder_learning_rate)
   decoder_optimizer = tf.compat.v1.train.AdamOptimizer(decoder_learning_rate)
   decoder_train_op = encoder_optimizer.minimize(positive_loss, var_list=variable_lib.get_trainable_variables(decoder_scope))
  
   # Train generator 
+  generator_loss = generator_negative_log_likelihood
+  #generator_loss = negative_loss - generator_entropy
   generator_learning_rate = tf.compat.v1.train.cosine_decay(params["learning_rate"], global_step, params["max_steps"])
-  tf.compat.v1.summary.scalar("generator_learning_rate", generator_learning_rate)
+  tf.compat.v1.summary.scalar("generator/learning_rate", generator_learning_rate)
   generator_optimizer = tf.compat.v1.train.AdamOptimizer(generator_learning_rate)
-  generator_train_op = generator_optimizer.minimize(negative_loss, var_list=variable_lib.get_trainable_variables(generator_scope))
+  generator_gradients, generator_variables = zip(*generator_optimizer.compute_gradients(generator_loss, var_list=variable_lib.get_trainable_variables(generator_scope)))
+  generator_clip_norm = clip_norm=params["generator_clip_gradient"]
+  generator_capped_gradients, generator_gradient_norm = tf.clip_by_global_norm(generator_gradients, generator_clip_norm)
+  generator_gradient_norm = tf.check_numerics(generator_gradient_norm, "Gradient norm contains NaNs or Infs.")
+  tf.summary.scalar("generator/gradient_norm", tf.reshape(generator_gradient_norm, []))
+  generator_capped_gradients_and_variables = zip(generator_capped_gradients, generator_variables)
+  generator_train_op = generator_optimizer.apply_gradients(generator_capped_gradients_and_variables)
 
   from tensorflow.contrib.gan import RunTrainOpsHook
   return tf.estimator.EstimatorSpec(
       mode=mode,
-      loss=positive_loss,
+      loss=positive_loss-negative_loss,
       train_op=global_step.assign_add(1),
       training_hooks=[RunTrainOpsHook(encoder_train_op,1), RunTrainOpsHook(decoder_train_op,1), RunTrainOpsHook(generator_train_op,1)],
       eval_metric_ops={**positive_eval_metric_ops, **negative_eval_metric_ops},
@@ -633,12 +644,16 @@ def main(argv):
     train_input_fn, eval_input_fn = build_input_fns(FLAGS.data_dir,
                                                     FLAGS.batch_size)
 
+  session_config = tf.ConfigProto()
+  session_config.gpu_options.allow_growth=True
   estimator = tf.estimator.Estimator(
       model_fn,
       params=params,
       config=tf.estimator.RunConfig(
+          session_config=session_config,
           model_dir=FLAGS.model_dir,
           save_checkpoints_steps=FLAGS.viz_steps,
+          #save_summary_steps=1
       ),
   )
 
