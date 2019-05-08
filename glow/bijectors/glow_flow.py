@@ -79,9 +79,7 @@ class GlowStep(tfb.Bijector):
             # We need to reshape because `tfb.RealNVP` only supports 1d input
             # TODO(hartikainen): This should not require inverting
             flatten = tfb.Invert(tfb.Reshape(
-                #event_shape_out=(-1, np.prod(self._image_shape)),
                 event_shape_out=(np.prod(self._image_shape),),
-                #event_shape_in=[-1] + list(self._image_shape)))
                 event_shape_in=list(self._image_shape)))
             affine_coupling = tfb.RealNVP(
                 num_masked=np.prod(self._image_shape)//2,
@@ -92,9 +90,7 @@ class GlowStep(tfb.Bijector):
                     activation=tf.nn.relu))
             # TODO(hartikainen): This should not require inverting
             unflatten = tfb.Invert(tfb.Reshape(
-                #event_shape_out=[-1] + list(self._image_shape),
                 event_shape_out=list(self._image_shape),
-                #event_shape_in=(-1, np.prod(self._image_shape))))
                 event_shape_in=(np.prod(self._image_shape),)))
 
             flow_parts += [

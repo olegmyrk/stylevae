@@ -174,7 +174,7 @@ flags.DEFINE_integer(
     default=2,
     help="Number of flow steps in each Glow level.")
 flags.DEFINE_float(
-    "generator_clip_gradient", default=1.0, help="Generator gradient clip norm.")
+    "generator_clip_gradient", default=1000.0, help="Generator gradient clip norm.")
 
 FLAGS = flags.FLAGS
 
