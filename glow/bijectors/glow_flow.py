@@ -10,7 +10,6 @@ import numpy as np
 
 from .squeeze import Squeeze
 from .parallel import Parallel
-from .convolution_permute import ConvolutionPermute
 
 
 __all__ = [
@@ -33,13 +32,11 @@ class GlowStep(tfb.Bijector):
                  name="glow_bijector",
                  *args, **kwargs):
         """Instantiates `GlowStep`, a single bijective step of `GlowFlow`.
-
         Args:
             TODO
             validate_args: Python `bool` indicating whether arguments should be
                 checked for correctness.
             name: Python `str` name given to ops managed by this object.
-
         Raises:
             ValueError: if TODO happens
         """
@@ -73,8 +70,10 @@ class GlowStep(tfb.Bijector):
             activation_normalization = tfb.BatchNormalization(
                 batchnorm_layer=tf.layers.BatchNormalization(axis=-1))
 
-            convolution_permute = ConvolutionPermute(
-                name=self._name + '/convolution_permute_{}'.format(i))
+            #convolution_permute = ConvolutionPermute(
+            #    name=self._name + '/convolution_permute_{}'.format(i))
+            convolution_permute = trainable_lu_factorization(
+                    event_size=input_shape[-1], name=self._name + '/convolution_permute_{}'.format(i))
 
             # We need to reshape because `tfb.RealNVP` only supports 1d input
             # TODO(hartikainen): This should not require inverting
@@ -145,13 +144,11 @@ class GlowFlow(tfb.Bijector):
                  name="glow_flow",
                  *args, **kwargs):
         """Instantiates the `GlowFlow` normalizing flow.
-
         Args:
             TODO
             validate_args: Python `bool` indicating whether arguments should be
                 checked for correctness.
             name: Python `str` name given to ops managed by this object.
-
         Raises:
             ValueError: if TODO happens
         """
@@ -195,7 +192,7 @@ class GlowFlow(tfb.Bijector):
                                 input_shape=None,
                                 depth=self._level_depth,
                                 name="glow_step_{}".format(i)),
-                            #tfb.Identity(),
+                            tfb.Identity(),
                         ],
                         split_axis=-1,
                         split_proportions=[1, 2**(i)-1]
@@ -317,3 +314,23 @@ def glow_resnet_template(
             return shift, log_scale
 
         return tf.make_template("glow_resnet_template", _fn)
+
+def trainable_lu_factorization(event_size, batch_shape=(), seed=None, dtype=tf.float32, name=None):
+  with tf.name_scope(name, 'trainable_lu_factorization',
+                     [event_size, batch_shape]):
+    event_size = tf.convert_to_tensor(
+        event_size, preferred_dtype=tf.int32, name='event_size')
+    batch_shape = tf.convert_to_tensor(
+        batch_shape, preferred_dtype=event_size.dtype, name='batch_shape')
+    random_matrix = tf.random_uniform(
+        shape=tf.concat([batch_shape, [event_size, event_size]], axis=0),
+        dtype=dtype,
+        seed=seed)
+    random_orthonormal = tf.linalg.qr(random_matrix)[0]
+    lower_upper, permutation = tf.linalg.lu(random_orthonormal)
+    lower_upper = tf.Variable(
+        initial_value=lower_upper,
+        trainable=True,
+        use_resource=True,
+        name='lower_upper')
+  return tfb.MatvecLU(lower_upper, permutation, validate_args=True)
