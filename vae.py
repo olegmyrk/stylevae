@@ -271,8 +271,8 @@ def make_decoder(activation, latent_size, output_shape, base_depth, scale_min=0.
     tf.compat.v1.summary.scalar(label + "scale_max", tf.reduce_max(input_tensor=scale))
     tf.compat.v1.summary.scalar(label + "scale_min", tf.reduce_min(input_tensor=scale))
 
-    #return tfd.Independent(tfd.Logistic(loc=loc,scale=scale),reinterpreted_batch_ndims=len(output_shape),name="image")
-    return tfd.Independent(tfd.Normal(loc=loc,scale=scale),reinterpreted_batch_ndims=len(output_shape),name="image")
+    return tfd.Independent(tfd.Logistic(loc=loc,scale=scale),reinterpreted_batch_ndims=len(output_shape),name="image")
+    #return tfd.Independent(tfd.Normal(loc=loc,scale=scale),reinterpreted_batch_ndims=len(output_shape),name="image")
 
   return decoder
 
@@ -551,7 +551,7 @@ def model_fn(features, labels, mode, params, config):
 
       return encoder_scope, encoder, entropy_fn
 
-  decoder_scope, decoder, latent_prior, encoder_scope, encoder, elbo_fn = build_vae("vae_", deterministic_encoder=True)
+  decoder_scope, decoder, latent_prior, encoder_scope, encoder, elbo_fn = build_vae("vae_", deterministic_encoder=False)
   entropy_encoder_scope, entropy_encoder, entropy_fn = build_entropy("entropy_")
 
   # Decode samples from the prior for visualization.
