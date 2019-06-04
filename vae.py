@@ -271,8 +271,8 @@ def make_decoder(activation, latent_size, output_shape, base_depth, scale_min=0.
     tf.compat.v1.summary.scalar(label + "scale_max", tf.reduce_max(input_tensor=scale))
     tf.compat.v1.summary.scalar(label + "scale_min", tf.reduce_min(input_tensor=scale))
 
-    return tfd.Independent(tfd.Logistic(loc=loc,scale=scale),reinterpreted_batch_ndims=len(output_shape),name="image")
-    #return tfd.Independent(tfd.Normal(loc=loc,scale=scale),reinterpreted_batch_ndims=len(output_shape),name="image")
+    #return tfd.Independent(tfd.Logistic(loc=loc,scale=scale),reinterpreted_batch_ndims=len(output_shape),name="image")
+    return tfd.Independent(tfd.Normal(loc=loc,scale=scale),reinterpreted_batch_ndims=len(output_shape),name="image")
 
   return decoder
 
@@ -439,7 +439,7 @@ def model_fn(features, labels, mode, params, config):
                                  params["latent_size"],
                                  IMAGE_SHAPE,
                                  params["base_depth"])
-          latent_prior = make_mixture_prior(params["latent_size"],
+          decoder_prior = make_mixture_prior(params["latent_size"],
                                             params["mixture_components"])
 
       def elbo_fn(inputs, label):
@@ -488,13 +488,13 @@ def model_fn(features, labels, mode, params, config):
           tf.compat.v1.summary.scalar(label + "distortion_min", tf.reduce_min(input_tensor=distortion))
 
           if params["analytic_kl"]:
-            rate = tfd.kl_divergence(approx_posterior, latent_prior)
+            rate = tfd.kl_divergence(approx_posterior, decoder_prior)
           else:
             if deterministic_encoder:
-                rate = (- latent_prior.log_prob(approx_posterior_sample))
+                rate = (- decoder_prior.log_prob(approx_posterior_sample))
             else:
                 rate = (approx_posterior.log_prob(approx_posterior_sample)
-                        - latent_prior.log_prob(approx_posterior_sample))
+                        - decoder_prior.log_prob(approx_posterior_sample))
           avg_rate = tf.reduce_mean(input_tensor=rate)
           tf.compat.v1.summary.scalar(label + "rate", avg_rate)
 
@@ -520,43 +520,98 @@ def model_fn(features, labels, mode, params, config):
               }
           return elbo, importance_weighted_elbo, eval_metric_ops
 
-      return decoder_scope, decoder, latent_prior, encoder_scope, encoder, elbo_fn
+      return decoder_scope, decoder, decoder_prior, encoder_scope, encoder, elbo_fn
 
-  def build_entropy(entropy_label):
-      with variable_scope.variable_scope(entropy_label + "encoder", reuse=tf.AUTO_REUSE) as encoder_scope:
+  def build_rvae(rvae_label, deterministic_decoder=False):
+      with variable_scope.variable_scope(rvae_label + "encoder", reuse=tf.AUTO_REUSE) as encoder_scope:
           encoder = make_encoder(params["activation"],
                                  params["latent_size"],
                                  params["base_depth"])
 
-      def entropy_fn(decoder_input, decoder_output, label):
+      with variable_scope.variable_scope(rvae_label + "decoder", reuse=tf.AUTO_REUSE) as decoder_scope:
+          decoder = make_decoder(params["activation"],
+                                 params["latent_size"],
+                                 IMAGE_SHAPE,
+                                 params["base_depth"])
+          decoder_prior = make_mixture_prior(params["latent_size"],
+                                            params["mixture_components"])
+
+      def relbo_fn(label):
+          with variable_scope.variable_scope(decoder_scope, reuse=tf.AUTO_REUSE):
+              decoder_input = decoder_prior.sample(params["n_samples"])
+              decoder_likelihood = decoder(decoder_input, label)
+
+              if deterministic_decoder:
+                  decoder_output = decoder_likelihood.mean()
+              else:
+                  decoder_output = tf.squeeze(decoder_likelihood.sample(1),axis=0)
+
           with variable_scope.variable_scope(encoder_scope, reuse=tf.AUTO_REUSE):
               approx_posterior = encoder(decoder_output)
 
-          reconstruction = approx_posterior.log_prob(decoder_input)
-          avg_reconstruction = tf.reduce_mean(input_tensor=reconstruction)
-          tf.compat.v1.summary.scalar(label + "reconstruction", avg_reconstruction)
+          image_tile_summary(
+              label + "random/sample",
+              tf.cast(decoder_likelihood.sample(), dtype=tf.float32),
+              rows=4,
+              cols=4)
+          image_tile_summary(
+              label + "random/mean",
+              decoder_likelihood.mean(),
+              rows=4,
+              cols=4)
+          image_tile_summary(
+              label + "random/stddev",
+              decoder_likelihood.stddev(),
+              rows=4,
+              cols=4)
+          
+          tf.compat.v1.summary.scalar(label + "encoder/stddev/min", tf.reduce_min(approx_posterior.stddev()))
+          tf.compat.v1.summary.scalar(label + "decoder/stddev/min", tf.reduce_min(decoder_likelihood.stddev()))
 
-          tf.compat.v1.summary.scalar(label + "reconstruction_max", tf.reduce_max(input_tensor=reconstruction))
-          tf.compat.v1.summary.scalar(label + "reconstruction_min", tf.reduce_min(input_tensor=reconstruction))
+          # `distortion` is just the negative log likelihood.
+          if deterministic_decoder:
+              distortion = tf.constant(0.0)
+          else:
+              distortion = -decoder_likelihood.log_prob(decoder_output)
 
-          entropy = tf.reduce_mean(reconstruction)
+          avg_distortion = tf.reduce_mean(input_tensor=distortion)
+          tf.compat.v1.summary.scalar(label + "distortion", avg_distortion)
+
+          tf.compat.v1.summary.scalar(label + "distortion_max", tf.reduce_max(input_tensor=distortion))
+          tf.compat.v1.summary.scalar(label + "distortion_min", tf.reduce_min(input_tensor=distortion))
+
+          if deterministic_decoder:
+            rate = (approx_posterior.log_prob(decoder_input))
+          else:
+            rate = (approx_posterior.log_prob(decoder_input)
+                    - decoder_prior.log_prob(decoder_input))
+
+          avg_rate = tf.reduce_mean(input_tensor=rate)
+          tf.compat.v1.summary.scalar(label + "rate", avg_rate)
+
+          relbo_local = (rate + distortion)
+
+          relbo = tf.reduce_mean(input_tensor=relbo_local)
+          tf.compat.v1.summary.scalar(label + "relbo", relbo)
 
           eval_metric_ops = {
-                  label + "entropy":
-                      tf.compat.v1.metrics.mean(entropy),
-                  label + "reconstruction":
-                      tf.compat.v1.metrics.mean(avg_reconstruction)
+                  label + "relbo":
+                      tf.compat.v1.metrics.mean(relbo),
+                  label + "rate":
+                      tf.compat.v1.metrics.mean(avg_rate),
+                  label + "distortion":
+                      tf.compat.v1.metrics.mean(avg_distortion),
               }
-          return entropy, eval_metric_ops
+          return decoder_input, decoder_output, relbo, eval_metric_ops
 
-      return encoder_scope, encoder, entropy_fn
+      return decoder_scope, decoder, decoder_prior, encoder_scope, encoder, relbo_fn
 
-  decoder_scope, decoder, latent_prior, encoder_scope, encoder, elbo_fn = build_vae("vae_", deterministic_encoder=False)
-  entropy_encoder_scope, entropy_encoder, entropy_fn = build_entropy("entropy_")
+  decoder_scope, decoder, decoder_prior, encoder_scope, encoder, elbo_fn = build_vae("vae_", deterministic_encoder=False)
+  generator_scope, generator, generator_prior, entropy_encoder_scope, entropy_encoder, relbo_fn = build_rvae("rvae_", deterministic_decoder=False)
 
   # Decode samples from the prior for visualization.
   with variable_scope.variable_scope(decoder_scope, reuse=tf.AUTO_REUSE):
-      decoder_random_image = decoder(latent_prior.sample(16), "sample/")
+      decoder_random_image = decoder(decoder_prior.sample(16), "vae_sample/")
 
   image_tile_summary(
       "decoder/random/sample",
@@ -566,46 +621,20 @@ def model_fn(features, labels, mode, params, config):
   image_tile_summary("decoder/random/mean", decoder_random_image.mean(), rows=4, cols=4)
   image_tile_summary("decoder/random/stddev", decoder_random_image.stddev(), rows=4, cols=4)
 
-  # Generator
-  with variable_scope.variable_scope("generator", reuse=tf.AUTO_REUSE) as generator_scope:
-      generator_prior = make_mixture_prior(params["latent_size"],
-                                        params["mixture_components"])
-      generator = make_generator(params["activation"],
-                             generator_prior.event_shape[-1],
-                             IMAGE_SHAPE,
-                             params["base_depth"])
-
-      generator_input = generator_prior.sample(params["n_samples"])
-      generator_output = generator(generator_input)
-
-      generator_random_directions = tf.math.l2_normalize(tf.random_normal(tf.shape(generator_input)), axis=1)
-      from tensorflow.contrib.nn.python.ops import fwd_gradients
-      generator_direction_gradients = fwd_gradients.fwd_gradients([generator_output], [generator_input], [generator_random_directions])[0]
-
-  # Generator samples for visualization.
-  with variable_scope.variable_scope(generator_scope, reuse=tf.AUTO_REUSE):
-      generator_random_image = generator(generator_prior.sample(16))
-  image_tile_summary(
-      "generator/random/sample",
-      tf.cast(generator_random_image, dtype=tf.float32),
-      rows=4,
-      cols=4)
-
   # Build positive loss
   positive_elbo, positive_importance_weighted_elbo, positive_eval_metric_ops = elbo_fn(features, "positive/")
   positive_loss = -positive_elbo
+
+  # Build entropy loss
+  generator_input, generator_output, entropy, entropy_eval_metric_ops = relbo_fn("generator/")
+  entropy_loss = -entropy
 
   # Build negative loss
   negative_elbo, negative_importance_weighted_elbo, negative_eval_metric_ops = elbo_fn(generator_output, "negative/")
   negative_loss = -negative_elbo
 
-  # Build entropy loss
-  entropy, entropy_eval_metric_ops = entropy_fn(generator_input, generator_output, "generator/")
-  entropy_loss = -entropy
-
   # Build generator loss
   generator_reg = 0
-  #generator_reg += -tf.reduce_mean(np.prod(IMAGE_SHAPE)*tf.math.log(1e-3 + tf.norm(generator_direction_gradients, axis=1)))
   generator_reg = -entropy
   generator_loss = -negative_elbo
   generator_reg_loss = generator_loss + generator_reg
