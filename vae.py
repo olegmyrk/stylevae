@@ -271,8 +271,8 @@ def make_decoder(activation, latent_size, output_shape, base_depth, scale_min=0.
     tf.compat.v1.summary.scalar(label + "scale_max", tf.reduce_max(input_tensor=scale))
     tf.compat.v1.summary.scalar(label + "scale_min", tf.reduce_min(input_tensor=scale))
 
-    #return tfd.Independent(tfd.Logistic(loc=loc,scale=scale),reinterpreted_batch_ndims=len(output_shape),name="image")
-    return tfd.Independent(tfd.Normal(loc=loc,scale=scale),reinterpreted_batch_ndims=len(output_shape),name="image")
+    return tfd.Independent(tfd.Logistic(loc=loc,scale=scale),reinterpreted_batch_ndims=len(output_shape),name="image")
+    #return tfd.Independent(tfd.Normal(loc=loc,scale=scale),reinterpreted_batch_ndims=len(output_shape),name="image")
 
   return decoder
 
@@ -522,7 +522,7 @@ def model_fn(features, labels, mode, params, config):
 
       return decoder_scope, decoder, decoder_prior, encoder_scope, encoder, elbo_fn
 
-  def build_rvae(rvae_label, deterministic_decoder=False):
+  def build_rvae(rvae_label, mixture_components=params["mixture_components"], deterministic_decoder=False, beta=1.0):
       with variable_scope.variable_scope(rvae_label + "encoder", reuse=tf.AUTO_REUSE) as encoder_scope:
           encoder = make_encoder(params["activation"],
                                  params["latent_size"],
@@ -534,11 +534,11 @@ def model_fn(features, labels, mode, params, config):
                                  IMAGE_SHAPE,
                                  params["base_depth"])
           decoder_prior = make_mixture_prior(params["latent_size"],
-                                            params["mixture_components"])
+                                            mixture_components)
 
       def relbo_fn(label):
           with variable_scope.variable_scope(decoder_scope, reuse=tf.AUTO_REUSE):
-              decoder_input = decoder_prior.sample(params["n_samples"])
+              decoder_input = decoder_prior.sample(params["batch_size"])
               decoder_likelihood = decoder(decoder_input, label)
 
               if deterministic_decoder:
@@ -551,7 +551,7 @@ def model_fn(features, labels, mode, params, config):
 
           image_tile_summary(
               label + "random/sample",
-              tf.cast(decoder_likelihood.sample(), dtype=tf.float32),
+              tf.cast(decoder_output, dtype=tf.float32),
               rows=4,
               cols=4)
           image_tile_summary(
@@ -581,9 +581,9 @@ def model_fn(features, labels, mode, params, config):
           tf.compat.v1.summary.scalar(label + "distortion_min", tf.reduce_min(input_tensor=distortion))
 
           if deterministic_decoder:
-            rate = (approx_posterior.log_prob(decoder_input))
+            rate = beta*(approx_posterior.log_prob(decoder_input))
           else:
-            rate = (approx_posterior.log_prob(decoder_input)
+            rate = beta*(approx_posterior.log_prob(decoder_input)
                     - decoder_prior.log_prob(decoder_input))
 
           avg_rate = tf.reduce_mean(input_tensor=rate)
@@ -607,7 +607,7 @@ def model_fn(features, labels, mode, params, config):
       return decoder_scope, decoder, decoder_prior, encoder_scope, encoder, relbo_fn
 
   decoder_scope, decoder, decoder_prior, encoder_scope, encoder, elbo_fn = build_vae("vae_", deterministic_encoder=False)
-  generator_scope, generator, generator_prior, entropy_encoder_scope, entropy_encoder, relbo_fn = build_rvae("rvae_", deterministic_decoder=False)
+  generator_scope, generator, generator_prior, entropy_encoder_scope, entropy_encoder, relbo_fn = build_rvae("rvae_", mixture_components=1, deterministic_decoder=False, beta=1.0)
 
   # Decode samples from the prior for visualization.
   with variable_scope.variable_scope(decoder_scope, reuse=tf.AUTO_REUSE):
@@ -635,7 +635,7 @@ def model_fn(features, labels, mode, params, config):
 
   # Build generator loss
   generator_reg = 0
-  generator_reg = -entropy
+  generator_reg += -entropy
   generator_loss = -negative_elbo
   generator_reg_loss = generator_loss + generator_reg
   tf.compat.v1.summary.scalar("generator/generator_reg", generator_reg)
