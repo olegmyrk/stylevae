@@ -428,7 +428,7 @@ def model_fn(features, labels, mode, params, config):
   image_tile_summary(
       "input", tf.cast(features, dtype=tf.float32), rows=1, cols=16)
  
-  def build_vae(vae_label, deterministic_encoder=False):
+  def build_vae(vae_label, mixture_components=params["mixture_components"], latent_size=params["latent_size"], deterministic_encoder=False):
       with variable_scope.variable_scope(vae_label + "encoder", reuse=tf.AUTO_REUSE) as encoder_scope:
           encoder = make_encoder(params["activation"],
                                  params["latent_size"],
@@ -439,8 +439,8 @@ def model_fn(features, labels, mode, params, config):
                                  params["latent_size"],
                                  IMAGE_SHAPE,
                                  params["base_depth"])
-          decoder_prior = make_mixture_prior(params["latent_size"],
-                                            params["mixture_components"])
+          decoder_prior = make_mixture_prior(latent_size,
+                                            mixture_components)
 
       def elbo_fn(inputs, label):
           with variable_scope.variable_scope(encoder_scope, reuse=tf.AUTO_REUSE):
@@ -522,7 +522,7 @@ def model_fn(features, labels, mode, params, config):
 
       return decoder_scope, decoder, decoder_prior, encoder_scope, encoder, elbo_fn
 
-  def build_rvae(rvae_label, mixture_components=params["mixture_components"], deterministic_decoder=False, beta=1.0):
+  def build_rvae(rvae_label, mixture_components=params["mixture_components"], latent_size=params["latent_size"], deterministic_decoder=False):
       with variable_scope.variable_scope(rvae_label + "encoder", reuse=tf.AUTO_REUSE) as encoder_scope:
           encoder = make_encoder(params["activation"],
                                  params["latent_size"],
@@ -533,7 +533,7 @@ def model_fn(features, labels, mode, params, config):
                                  params["latent_size"],
                                  IMAGE_SHAPE,
                                  params["base_depth"])
-          decoder_prior = make_mixture_prior(params["latent_size"],
+          decoder_prior = make_mixture_prior(latent_size,
                                             mixture_components)
 
       def relbo_fn(label):
@@ -581,9 +581,9 @@ def model_fn(features, labels, mode, params, config):
           tf.compat.v1.summary.scalar(label + "distortion_min", tf.reduce_min(input_tensor=distortion))
 
           if deterministic_decoder:
-            rate = beta*(approx_posterior.log_prob(decoder_input))
+            rate = (approx_posterior.log_prob(decoder_input))
           else:
-            rate = beta*(approx_posterior.log_prob(decoder_input)
+            rate = (approx_posterior.log_prob(decoder_input)
                     - decoder_prior.log_prob(decoder_input))
 
           avg_rate = tf.reduce_mean(input_tensor=rate)
@@ -607,7 +607,7 @@ def model_fn(features, labels, mode, params, config):
       return decoder_scope, decoder, decoder_prior, encoder_scope, encoder, relbo_fn
 
   decoder_scope, decoder, decoder_prior, encoder_scope, encoder, elbo_fn = build_vae("vae_", deterministic_encoder=False)
-  generator_scope, generator, generator_prior, entropy_encoder_scope, entropy_encoder, relbo_fn = build_rvae("rvae_", mixture_components=1, deterministic_decoder=False, beta=1.0)
+  generator_scope, generator, generator_prior, entropy_encoder_scope, entropy_encoder, relbo_fn = build_rvae("rvae_", mixture_components=1, deterministic_decoder=False)
 
   # Decode samples from the prior for visualization.
   with variable_scope.variable_scope(decoder_scope, reuse=tf.AUTO_REUSE):
