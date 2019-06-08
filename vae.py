@@ -208,8 +208,8 @@ def make_encoder(activation, latent_size, base_depth, scale_min=0.01, scale_rang
     net = encoder_net(images)
     return tfd.MultivariateNormalDiag(
         loc=net[..., :latent_size],
-        scale_diag=scale_min + scale_range*tf.nn.softplus(net[..., latent_size:] +
-                                  _softplus_inverse(1.0)),
+        #scale_diag=scale_min + scale_range*tf.nn.softplus(net[..., latent_size:] + _softplus_inverse(1.0)),
+        scale_diag=scale_min + scale_range*tf.nn.sigmoid(net[..., latent_size:]),
         name="code")
 
   return encoder
@@ -261,7 +261,8 @@ def make_decoder(activation, latent_size, output_shape, base_depth, scale_min=0.
 
     loc=logits[...,:output_depth]
     scale_raw=tf.compat.v1.get_variable(name="scale_input", dtype=tf.float32, shape=[])
-    scale=tf.scalar_mul(scale_min + scale_range*tf.nn.softplus(scale_raw), tf.ones_like(loc))
+    #scale=tf.scalar_mul(scale_min + scale_range*tf.nn.softplus(scale_raw), tf.ones_like(loc))
+    scale=tf.scalar_mul(scale_min + scale_range*tf.nn.sigmoid(scale_raw), tf.ones_like(loc))
     #scale=scale_min+scale_range*tf.nn.sigmoid(logits[...,output_depth:])
 
     tf.compat.v1.summary.scalar(label + "loc", tf.reduce_mean(input_tensor=loc))
@@ -565,8 +566,12 @@ def model_fn(features, labels, mode, params, config):
               rows=4,
               cols=4)
           
+          tf.compat.v1.summary.scalar(label + "encoder/stddev", tf.reduce_mean(approx_posterior.stddev()))
           tf.compat.v1.summary.scalar(label + "encoder/stddev/min", tf.reduce_min(approx_posterior.stddev()))
+          tf.compat.v1.summary.scalar(label + "encoder/stddev/max", tf.reduce_max(approx_posterior.stddev()))
+          tf.compat.v1.summary.scalar(label + "decoder/stddev", tf.reduce_mean(decoder_likelihood.stddev()))
           tf.compat.v1.summary.scalar(label + "decoder/stddev/min", tf.reduce_min(decoder_likelihood.stddev()))
+          tf.compat.v1.summary.scalar(label + "decoder/stddev/max", tf.reduce_max(decoder_likelihood.stddev()))
 
           # `distortion` is just the negative log likelihood.
           if deterministic_decoder:
