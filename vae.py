@@ -677,7 +677,7 @@ def model_fn(features, labels, mode, params, config):
   from tensorflow.contrib.gan import RunTrainOpsHook
   return tf.estimator.EstimatorSpec(
       mode=mode,
-      loss=positive_loss,
+      loss=positive_loss-negative_loss,
       train_op=global_step.assign_add(1),
       training_hooks=[RunTrainOpsHook(encoder_train_op,1), RunTrainOpsHook(decoder_train_op,1), RunTrainOpsHook(entropy_train_op,1), RunTrainOpsHook(generator_train_op,1)],
       eval_metric_ops={**positive_eval_metric_ops, **negative_eval_metric_ops, **entropy_eval_metric_ops},
