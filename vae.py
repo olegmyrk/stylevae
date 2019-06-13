@@ -180,7 +180,7 @@ def _softplus_inverse(x):
   return tf.math.log(tf.math.expm1(x))
 
 
-def make_encoder(activation, latent_size, base_depth, scale_min=0.01, scale_range=0.1):
+def make_encoder(activation, latent_size, base_depth, scale_min=0.01, scale_range=0.1, spectral=False):
   """Creates the encoder function.
   Args:
     activation: Activation function in hidden layers.
@@ -190,17 +190,23 @@ def make_encoder(activation, latent_size, base_depth, scale_min=0.01, scale_rang
     encoder: A `callable` mapping a `Tensor` of images to a
       `tfd.Distribution` instance over encodings.
   """
-  conv = functools.partial(
-      tf.keras.layers.Conv2D, padding="SAME", activation=activation)
+
+  if not spectral:
+    conv = functools.partial(tf.keras.layers.Conv2D, padding="SAME", activation=activation)
+    dense = functools.partial(tf.keras.layers.Dense)
+  else:
+    from libs.spectral import ConvSN2D, DenseSN
+    conv = functools.partial(ConvSN2D, padding="SAME", activation=activation)
+    dense = functools.partial(DenseSN)
 
   encoder_net = tf.keras.Sequential([
-      conv(base_depth, 5, 1),
-      conv(base_depth, 5, 2),
-      conv(2 * base_depth, 5, 1),
-      conv(2 * base_depth, 5, 2),
-      conv(4 * latent_size, 7, padding="VALID"),
+      conv(base_depth, kernel_size=5, strides=1),
+      conv(base_depth, kernel_size=5, strides=2),
+      conv(2 * base_depth, kernel_size=5, strides=1),
+      conv(2 * base_depth, kernel_size=5, strides=2),
+      conv(4 * latent_size, kernel_size=7, padding="VALID"),
       tf.keras.layers.Flatten(),
-      tf.keras.layers.Dense(2 * latent_size, activation=None),
+      dense(2 * latent_size, activation=None),
   ], name="EncoderSequential")
 
   def encoder(images):
@@ -215,7 +221,7 @@ def make_encoder(activation, latent_size, base_depth, scale_min=0.01, scale_rang
   return encoder
 
 
-def make_decoder(activation, latent_size, output_shape, base_depth, scale_min=0.01, scale_range=0.1):
+def make_decoder(activation, latent_size, output_shape, base_depth, scale_min=0.01, scale_range=0.1, spectral=False):
   """Creates the decoder function.
   Args:
     activation: Activation function in hidden layers.
@@ -226,10 +232,14 @@ def make_decoder(activation, latent_size, output_shape, base_depth, scale_min=0.
     decoder: A `callable` mapping a `Tensor` of encodings to a
       `tfd.Distribution` instance over images.
   """
-  deconv = functools.partial(
-      tf.keras.layers.Conv2DTranspose, padding="SAME", activation=activation)
-  conv = functools.partial(
-      tf.keras.layers.Conv2D, padding="SAME", activation=activation)
+
+  if not spectral:
+    deconv = functools.partial(tf.keras.layers.Conv2DTranspose, padding="SAME", activation=activation)
+    conv = functools.partial(tf.keras.layers.Conv2D, padding="SAME", activation=activation)
+  else:
+    from libs.spectral import ConvSN2D, ConvSN2DTranspose 
+    deconv = functools.partial(ConvSN2DTranspose, padding="SAME", activation=activation)
+    conv = functools.partial(ConvSN2D, padding="SAME", activation=activation)
 
   output_depth = output_shape[-1]
 
